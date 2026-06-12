@@ -5,6 +5,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
+    "luxon": "npm install luxon"
   },
   "devDependencies": {
     "wrangler": "^4.61.0"
