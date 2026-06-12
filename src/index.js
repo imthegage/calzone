@@ -8,6 +8,8 @@
  * https://github.com/unicode-org/cldr/blob/main/common/supplemental/windowsZones.xml
  */
 
+import { DateTime } from 'luxon';
+
 const WINDOWS_TO_IANA = {
   "Dateline Standard Time": "Etc/GMT+12",
   "UTC-11": "Etc/GMT+11",
@@ -150,16 +152,34 @@ const WINDOWS_TO_IANA = {
   "Line Islands Standard Time": "Pacific/Kiritimati",
 };
 
-/**
- * Replace Windows timezone names with IANA names in ICS content
- */
+const LA_VTIMEZONE = [
+  "BEGIN:VTIMEZONE",
+  "TZID:America/Los_Angeles",
+  "X-LIC-LOCATION:America/Los_Angeles",
+  "BEGIN:DAYLIGHT",
+  "TZOFFSETFROM:-0800",
+  "TZOFFSETTO:-0700",
+  "TZNAME:PDT",
+  "DTSTART:19700308T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU",
+  "END:DAYLIGHT",
+  "BEGIN:STANDARD",
+  "TZOFFSETFROM:-0700",
+  "TZOFFSETTO:-0800",
+  "TZNAME:PST",
+  "DTSTART:19701101T020000",
+  "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU",
+  "END:STANDARD",
+  "END:VTIMEZONE"
+].join("\r\n");
+
 function fixTimezones(icsContent) {
   let result = icsContent;
 
   for (const [windowsTz, ianaTz] of Object.entries(WINDOWS_TO_IANA)) {
-    const escaped = windowsTz.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const escaped = windowsTz.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     result = result.replace(
-      new RegExp(`(TZID[=:])${escaped}`, 'g'),
+      new RegExp(`(TZID[=:])${escaped}`, "g"),
       `$1${ianaTz}`
     );
   }
@@ -167,20 +187,82 @@ function fixTimezones(icsContent) {
   return result;
 }
 
+function isValidTimezone(tz) {
+  try {
+    return !!DateTime.now().setZone(tz).isValid;
+  } catch {
+    return false;
+  }
+}
+
+function formatIcsDateTime(dt) {
+  return dt.toFormat("yyyyMMdd'T'HHmmss");
+}
+
+function convertAllEventTimes(icsContent, targetTz) {
+  const eventPattern =
+    /^(DTSTART|DTEND|RECURRENCE-ID|EXDATE|RDATE)((?:;[^:]*)?):(\d{8}T\d{6}Z|\d{8}T\d{6})$/gm;
+
+  return icsContent.replace(eventPattern, (match, propName, params = "", rawValue) => {
+    let cleanParams = params.replace(/;VALUE=DATE-TIME/gi, "");
+    const tzidMatch = cleanParams.match(/;TZID=([^;:]+)/i);
+    const sourceTz = tzidMatch ? tzidMatch[1] : null;
+    cleanParams = cleanParams.replace(/;TZID=[^;:]*/gi, "");
+
+    let dt;
+
+    if (rawValue.endsWith("Z")) {
+      dt = DateTime.fromFormat(rawValue, "yyyyMMdd'T'HHmmss'Z'", { zone: "utc" });
+    } else if (sourceTz && isValidTimezone(sourceTz)) {
+      dt = DateTime.fromFormat(rawValue, "yyyyMMdd'T'HHmmss", { zone: sourceTz });
+    } else {
+      dt = DateTime.fromFormat(rawValue, "yyyyMMdd'T'HHmmss", { zone: targetTz });
+    }
+
+    if (!dt.isValid) {
+      return match;
+    }
+
+    const converted = dt.setZone(targetTz);
+    return `${propName}${cleanParams};TZID=${targetTz}:${formatIcsDateTime(converted)}`;
+  });
+}
+
+function ensureVtimezone(icsContent, targetTz) {
+  if (targetTz !== "America/Los_Angeles") {
+    return icsContent;
+  }
+
+  if (/BEGIN:VTIMEZONE[\s\S]*?TZID:America\/Los_Angeles[\s\S]*?END:VTIMEZONE/m.test(icsContent)) {
+    return icsContent;
+  }
+
+  return icsContent.replace(
+    /BEGIN:VCALENDAR\r?\n/,
+    `BEGIN:VCALENDAR\r\n${LA_VTIMEZONE}\r\n`
+  );
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // Only proxy .ics files
-    if (!url.pathname.endsWith('.ics')) {
+    if (!url.pathname.endsWith(".ics")) {
       return env.ASSETS.fetch(request);
     }
 
+    const targetTz = url.searchParams.get("tz") || "America/Los_Angeles";
+
+    if (!isValidTimezone(targetTz)) {
+      return new Response(`Invalid timezone: ${targetTz}`, { status: 400 });
+    }
+
+    url.searchParams.delete("tz");
     const targetUrl = `https://${env.TARGET_HOST}${url.pathname}${url.search}`;
 
     try {
       const response = await fetch(targetUrl, {
-        headers: { 'User-Agent': 'Calzone/1.0' },
+        headers: { "User-Agent": "Calzone/1.0" },
       });
 
       if (!response.ok) {
@@ -190,16 +272,18 @@ export default {
       }
 
       const icsContent = await response.text();
-      const fixedContent = fixTimezones(icsContent);
+
+      let fixedContent = fixTimezones(icsContent);
+      fixedContent = convertAllEventTimes(fixedContent, targetTz);
+      fixedContent = ensureVtimezone(fixedContent, targetTz);
 
       return new Response(fixedContent, {
         headers: {
-          'Content-Type': 'text/calendar; charset=utf-8',
-          'Cache-Control': 'public, max-age=3600',
-          'Access-Control-Allow-Origin': '*',
+          "Content-Type": "text/calendar; charset=utf-8",
+          "Cache-Control": "public, max-age=3600",
+          "Access-Control-Allow-Origin": "*",
         },
       });
-
     } catch (error) {
       return new Response(`Error: ${error.message}`, { status: 500 });
     }
