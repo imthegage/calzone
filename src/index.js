@@ -148,8 +148,6 @@ const WINDOWS_TO_IANA = {
   "Tonga Standard Time": "Pacific/Tongatapu",
   "Samoa Standard Time": "Pacific/Apia",
   "Line Islands Standard Time": "Pacific/Kiritimati",
-};
-
 /**
  * Replace Windows timezone names with IANA names in ICS content
  */
@@ -167,6 +165,66 @@ function fixTimezones(icsContent) {
   return result;
 }
 
+/**
+ * Convert UTC timestamps (ending with Z) to a target IANA timezone.
+ * Uses Intl.DateTimeFormat which handles DST transitions correctly.
+ */
+function shiftUtcToTimezone(icsContent, targetTz) {
+  // Match ICS properties with UTC datetime values (ending in Z)
+  // Handles: DTSTART, DTEND, RECURRENCE-ID, EXDATE, RDATE
+  // Formats: DTSTART:20240315T090000Z or DTSTART;VALUE=DATE-TIME:20240315T090000Z
+  const utcPattern = /^(DTSTART|DTEND|RECURRENCE-ID|EXDATE|RDATE)((?:;[^:]*)?):((\d{8}T\d{6})Z)$/gm;
+
+  const formatter = new Intl.DateTimeFormat('en-US', {
+    timeZone: targetTz,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+
+  return icsContent.replace(utcPattern, (match, propName, params, fullUtc, dateTimePart) => {
+    // Remove VALUE=DATE-TIME from params if present (TZID makes it implicit)
+    let cleanParams = params.replace(/;VALUE=DATE-TIME/gi, '');
+
+    // Parse UTC time components
+    const year = parseInt(dateTimePart.substring(0, 4));
+    const month = parseInt(dateTimePart.substring(4, 6)) - 1;
+    const day = parseInt(dateTimePart.substring(6, 8));
+    const hour = parseInt(dateTimePart.substring(9, 11));
+    const minute = parseInt(dateTimePart.substring(11, 13));
+    const second = parseInt(dateTimePart.substring(13, 15));
+
+    const date = new Date(Date.UTC(year, month, day, hour, minute, second));
+
+    // Format in target timezone
+    const parts = formatter.formatToParts(date);
+    const p = {};
+    for (const part of parts) p[part.type] = part.value;
+
+    // Intl may return hour "24" at midnight boundaries — normalize to "00"
+    const h = p.hour === '24' ? '00' : p.hour;
+    const localTime = `${p.year}${p.month}${p.day}T${h}${p.minute}${p.second}`;
+
+    return `${propName}${cleanParams};TZID=${targetTz}:${localTime}`;
+  });
+}
+
+/**
+ * Validate that a timezone string is a valid IANA timezone.
+ */
+function isValidTimezone(tz) {
+  try {
+    Intl.DateTimeFormat(undefined, { timeZone: tz });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -176,6 +234,14 @@ export default {
       return env.ASSETS.fetch(request);
     }
 
+    // Extract and validate the optional target timezone parameter
+    const targetTz = url.searchParams.get('tz');
+    if (targetTz && !isValidTimezone(targetTz)) {
+      return new Response(`Invalid timezone: ${targetTz}`, { status: 400 });
+    }
+
+    // Strip the tz param before forwarding to upstream
+    url.searchParams.delete('tz');
     const targetUrl = `https://${env.TARGET_HOST}${url.pathname}${url.search}`;
 
     try {
@@ -190,7 +256,12 @@ export default {
       }
 
       const icsContent = await response.text();
-      const fixedContent = fixTimezones(icsContent);
+      let fixedContent = fixTimezones(icsContent);
+
+      // If a target timezone is specified, shift UTC timestamps to that timezone
+      if (targetTz) {
+        fixedContent = shiftUtcToTimezone(fixedContent, targetTz);
+      }
 
       return new Response(fixedContent, {
         headers: {
